@@ -1,0 +1,439 @@
+/**** Start of imports. If edited, may not auto-convert in the playground. ****/
+var table = ee.FeatureCollection("projects/ee-anandunr584/assets/fire_ground_truth"),
+    geometry = 
+    /* color: #00ffff */
+    /* shown: false */
+    /* displayProperties: [
+      {
+        "type": "rectangle"
+      }
+    ] */
+    ee.Geometry.Polygon(
+        [[[-74.17717939520931, 53.05044038312907],
+          [-74.17717939520931, 52.55896829819693],
+          [-72.74346357489681, 52.55896829819693],
+          [-72.74346357489681, 53.05044038312907]]], null, false),
+    geometry2 = 
+    /* color: #d63000 */
+    /* shown: false */
+    /* displayProperties: [
+      {
+        "type": "rectangle"
+      }
+    ] */
+    ee.Geometry.Polygon(
+        [[[-74.13990429999397, 53.01692645279274],
+          [-74.13990429999397, 52.583521648061875],
+          [-72.76935986640022, 52.583521648061875],
+          [-72.76935986640022, 53.01692645279274]]], null, false),
+    image = ee.Image("projects/ee-anandunr584/assets/combined_masked_logRatio");
+/***** End of imports. If edited, may not auto-convert in the playground. *****/
+
+//// Terrain correction and Speckle Lee filter \\\\\\
+
+// Functions for terrain correction and LEE filter:
+// Implementation by Andreas Vollrath (ESA), inspired by Johannes Reiche (Wageningen)
+function terrainCorrection(image) { 
+  var imgGeom = image.geometry();
+  var srtm = ee.Image('USGS/SRTMGL1_003').clip(imgGeom); // 30m srtm 
+  var sigma0Pow = ee.Image.constant(10).pow(image.divide(10.0));
+  // Article ( numbers relate to chapters) 
+  // 2.1.1 Radar geometry 
+  var theta_i = image.select('angle');
+  var phi_i = ee.Terrain.aspect(theta_i)
+    .reduceRegion(ee.Reducer.mean(), theta_i.get('system:footprint'), 1000)
+    .get('aspect');
+  // 2.1.2 Terrain geometry
+  var alpha_s = ee.Terrain.slope(srtm).select('slope');
+  var phi_s = ee.Terrain.aspect(srtm).select('aspect');
+  // 2.1.3 Model geometry
+  // reduce to 3 angle
+  var phi_r = ee.Image.constant(phi_i).subtract(phi_s);
+  // convert all to radians
+  var phi_rRad = phi_r.multiply(Math.PI / 180);
+  var alpha_sRad = alpha_s.multiply(Math.PI / 180);
+  var theta_iRad = theta_i.multiply(Math.PI / 180);
+  var ninetyRad = ee.Image.constant(90).multiply(Math.PI / 180);
+  // slope steepness in range (eq. 2)
+  var alpha_r = (alpha_sRad.tan().multiply(phi_rRad.cos())).atan();
+  // slope steepness in azimuth (eq 3)
+  var alpha_az = (alpha_sRad.tan().multiply(phi_rRad.sin())).atan();
+  // local incidence angle (eq. 4)
+  var theta_lia = (alpha_az.cos().multiply((theta_iRad.subtract(alpha_r)).cos())).acos();
+  var theta_liaDeg = theta_lia.multiply(180 / Math.PI);
+  // 2.2 
+  // Gamma_nought_flat
+  var gamma0 = sigma0Pow.divide(theta_iRad.cos());
+  var gamma0dB = ee.Image.constant(10).multiply(gamma0.log10());
+  var ratio_1 = gamma0dB.select('VV').subtract(gamma0dB.select('VH'));
+  // Volumetric Model
+  var nominator = (ninetyRad.subtract(theta_iRad).add(alpha_r)).tan();
+  var denominator = (ninetyRad.subtract(theta_iRad)).tan();
+  var volModel = (nominator.divide(denominator)).abs();
+  // apply model
+  var gamma0_Volume = gamma0.divide(volModel);
+  var gamma0_VolumeDB = ee.Image.constant(10).multiply(gamma0_Volume.log10());
+  // we add a layover/shadow maskto the original implmentation
+  // layover, where slope > radar viewing angle 
+  var alpha_rDeg = alpha_r.multiply(180 / Math.PI);
+  var layover = alpha_rDeg.lt(theta_i);
+  // shadow where LIA > 90
+  var shadow = theta_liaDeg.lt(85);
+  // calculate the ratio for RGB vis
+  var ratio = gamma0_VolumeDB.select('VV').subtract(gamma0_VolumeDB.select('VH'));
+  var output = gamma0_VolumeDB.addBands(ratio).addBands(alpha_r).addBands(phi_s).addBands(theta_iRad)
+    .addBands(layover).addBands(shadow).addBands(gamma0dB).addBands(ratio_1);
+  return image.addBands(
+    output.select(['VV', 'VH'], ['VV', 'VH']),
+    null,
+    true
+  );
+}
+
+
+function powerToDb(img){
+  return ee.Image(10).multiply(img.log10());
+}
+
+function dbToPower(img){
+  return ee.Image(10).pow(img.divide(10));
+}
+
+// The RL speckle filter
+function refinedLee(image) {
+  var bandNames = image.bandNames();
+  image = dbToPower(image);
+  var result = ee.ImageCollection(bandNames.map(function(b){
+    var img = image.select([b]);
+    // img must be in natural units, i.e. not in dB!
+    // Set up 3x3 kernels 
+    var weights3 = ee.List.repeat(ee.List.repeat(1,3),3);
+    var kernel3 = ee.Kernel.fixed(3,3, weights3, 1, 1, false);
+    var mean3 = img.reduceNeighborhood(ee.Reducer.mean(), kernel3);
+    var variance3 = img.reduceNeighborhood(ee.Reducer.variance(), kernel3);
+    // Use a sample of the 3x3 windows inside a 7x7 windows to determine gradients and directions
+    var sample_weights = ee.List([[0,0,0,0,0,0,0], [0,1,0,1,0,1,0],[0,0,0,0,0,0,0], [0,1,0,1,0,1,0], [0,0,0,0,0,0,0], [0,1,0,1,0,1,0],[0,0,0,0,0,0,0]]);
+    var sample_kernel = ee.Kernel.fixed(7,7, sample_weights, 3,3, false);
+    // Calculate mean and variance for the sampled windows and store as 9 bands
+    var sample_mean = mean3.neighborhoodToBands(sample_kernel); 
+    var sample_var = variance3.neighborhoodToBands(sample_kernel);
+    // Determine the 4 gradients for the sampled windows
+    var gradients = sample_mean.select(1).subtract(sample_mean.select(7)).abs();
+    gradients = gradients.addBands(sample_mean.select(6).subtract(sample_mean.select(2)).abs());
+    gradients = gradients.addBands(sample_mean.select(3).subtract(sample_mean.select(5)).abs());
+    gradients = gradients.addBands(sample_mean.select(0).subtract(sample_mean.select(8)).abs());
+    // And find the maximum gradient amongst gradient bands
+    var max_gradient = gradients.reduce(ee.Reducer.max());
+    // Create a mask for band pixels that are the maximum gradient
+    var gradmask = gradients.eq(max_gradient);
+    // duplicate gradmask bands: each gradient represents 2 directions
+    gradmask = gradmask.addBands(gradmask);
+    // Determine the 8 directions
+    var directions = sample_mean.select(1).subtract(sample_mean.select(4)).gt(sample_mean.select(4).subtract(sample_mean.select(7))).multiply(1);
+    directions = directions.addBands(sample_mean.select(6).subtract(sample_mean.select(4)).gt(sample_mean.select(4).subtract(sample_mean.select(2))).multiply(2));
+    directions = directions.addBands(sample_mean.select(3).subtract(sample_mean.select(4)).gt(sample_mean.select(4).subtract(sample_mean.select(5))).multiply(3));
+    directions = directions.addBands(sample_mean.select(0).subtract(sample_mean.select(4)).gt(sample_mean.select(4).subtract(sample_mean.select(8))).multiply(4));
+    // The next 4 are the not() of the previous 4
+    directions = directions.addBands(directions.select(0).not().multiply(5));
+    directions = directions.addBands(directions.select(1).not().multiply(6));
+    directions = directions.addBands(directions.select(2).not().multiply(7));
+    directions = directions.addBands(directions.select(3).not().multiply(8));
+    // Mask all values that are not 1-8
+    directions = directions.updateMask(gradmask);
+    // "collapse" the stack into a singe band image (due to masking, each pixel has just one value (1-8) in it's directional band, and is otherwise masked)
+    directions = directions.reduce(ee.Reducer.sum());  
+    //var pal = ['ffffff','ff0000','ffff00', '00ff00', '00ffff', '0000ff', 'ff00ff', '000000'];
+    //Map.addLayer(directions.reduce(ee.Reducer.sum()), {min:1, max:8, palette: pal}, 'Directions', false);
+    var sample_stats = sample_var.divide(sample_mean.multiply(sample_mean));
+    // Calculate localNoiseVariance
+    var sigmaV = sample_stats.toArray().arraySort().arraySlice(0,0,5).arrayReduce(ee.Reducer.mean(), [0]);
+    // Set up the 7*7 kernels for directional statistics
+    var rect_weights = ee.List.repeat(ee.List.repeat(0,7),3).cat(ee.List.repeat(ee.List.repeat(1,7),4));
+    var diag_weights = ee.List([[1,0,0,0,0,0,0], [1,1,0,0,0,0,0], [1,1,1,0,0,0,0], 
+      [1,1,1,1,0,0,0], [1,1,1,1,1,0,0], [1,1,1,1,1,1,0], [1,1,1,1,1,1,1]]);
+    var rect_kernel = ee.Kernel.fixed(7,7, rect_weights, 3, 3, false);
+    var diag_kernel = ee.Kernel.fixed(7,7, diag_weights, 3, 3, false);
+    // Create stacks for mean and variance using the original kernels. Mask with relevant direction.
+    var dir_mean = img.reduceNeighborhood(ee.Reducer.mean(), rect_kernel).updateMask(directions.eq(1));
+    var dir_var = img.reduceNeighborhood(ee.Reducer.variance(), rect_kernel).updateMask(directions.eq(1));
+    dir_mean = dir_mean.addBands(img.reduceNeighborhood(ee.Reducer.mean(), diag_kernel).updateMask(directions.eq(2)));
+    dir_var = dir_var.addBands(img.reduceNeighborhood(ee.Reducer.variance(), diag_kernel).updateMask(directions.eq(2)));
+    // and add the bands for rotated kernels
+    for (var i=1; i<4; i++) {
+      dir_mean = dir_mean.addBands(img.reduceNeighborhood(ee.Reducer.mean(), rect_kernel.rotate(i)).updateMask(directions.eq(2*i+1)));
+      dir_var = dir_var.addBands(img.reduceNeighborhood(ee.Reducer.variance(), rect_kernel.rotate(i)).updateMask(directions.eq(2*i+1)));
+      dir_mean = dir_mean.addBands(img.reduceNeighborhood(ee.Reducer.mean(), diag_kernel.rotate(i)).updateMask(directions.eq(2*i+2)));
+      dir_var = dir_var.addBands(img.reduceNeighborhood(ee.Reducer.variance(), diag_kernel.rotate(i)).updateMask(directions.eq(2*i+2)));
+    }
+    // "collapse" the stack into a single band image (due to masking, each pixel has just one value in it's directional band, and is otherwise masked)
+    dir_mean = dir_mean.reduce(ee.Reducer.sum());
+    dir_var = dir_var.reduce(ee.Reducer.sum());
+    // A finally generate the filtered value
+    var varX = dir_var.subtract(dir_mean.multiply(dir_mean).multiply(sigmaV)).divide(sigmaV.add(1.0));
+    var b = varX.divide(dir_var);
+    return dir_mean.add(b.multiply(img.subtract(dir_mean)))
+      .arrayProject([0])
+      // Get a multi-band image bands.
+      .arrayFlatten([['sum']])
+      .float();
+  })).toBands().rename(bandNames);
+  return powerToDb(ee.Image(result));
+}
+
+
+
+////////////////////////  Sentinel 1 images  \\\\\\\\\\\\\\\\\\\\\\
+
+
+// Sentinel1 images, checking the available dates and number of images 
+var s1 = ee.ImageCollection('COPERNICUS/S1_GRD')
+           .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VH'))
+           .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
+           .filter(ee.Filter.eq('orbitProperties_pass', 'ASCENDING'))
+           .filter(ee.Filter.eq('instrumentMode', 'IW'))
+           .filterBounds(geometry)
+print('Number of images in the collection:', s1.size());
+// Get the list of dates
+var dates = s1.aggregate_array('system:time_start')
+              .map(function(d) {
+                return ee.Date(d).format('YYYY-MM-dd');
+              });
+print('Available dates:', dates);
+// Adjusted visualization parameters
+var vizParams = {
+  bands: ['VV', 'VH', 'angle'],
+  min: [-20, -25, 10],
+  max: [0, 0, 50],
+  gamma: 1.5
+};
+// For Pre-Fire Ascending orbit
+var s1_pre = ee.ImageCollection('COPERNICUS/S1_GRD')
+           .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
+           .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VH'))
+           .filter(ee.Filter.eq('orbitProperties_pass', 'ASCENDING'))
+           .filter(ee.Filter.eq('instrumentMode', 'IW'))
+           .filterBounds(geometry)
+           .filterDate('2023-05-07','2023-05-08')
+var PreNoTerrainCorrection = ee.Image(s1_pre.first()).clip(geometry2);
+
+
+// Terrain Correction
+s1_pre = s1_pre.map(terrainCorrection);
+var s1_pre_lee_sigma = s1_pre.map(refinedLee);
+var PrefirstTerrainCorrection = ee.Image(s1_pre.first()).clip(geometry2);
+var s1_pre_refinedLee  = ee.Image(s1_pre_lee_sigma.first()).clip(geometry2);
+print(s1_pre_refinedLee, 's1_prefire_refinedLee');
+
+
+// For Post-Fire Ascending orbit
+var s1_post = ee.ImageCollection('COPERNICUS/S1_GRD')
+           .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VH'))
+           .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
+           .filter(ee.Filter.eq('orbitProperties_pass', 'ASCENDING'))
+           .filter(ee.Filter.eq('instrumentMode', 'IW'))
+           .filterBounds(geometry)
+           .filterDate('2023-11-03','2023-11-04')
+var PostNoTerrainCorrection = ee.Image(s1_post.first()).clip(geometry2);
+print('Number of images in the collection:', s1_post.size());
+
+// Terrain Correction
+s1_post = s1_post.map(terrainCorrection);
+var s1_post_lee_sigma = s1_post.map(refinedLee);
+var PostfirstTerrainCorrection = ee.Image(s1_post.first()).clip(geometry2);
+var s1_post_refinedLee  = ee.Image(s1_post_lee_sigma.first()).clip(geometry2);
+print(s1_post_refinedLee, 's1_postfire_refinedLee');
+
+
+// Finding log ratio of the VV polarization
+var VV_logRatio = s1_post_refinedLee.select('VV')
+  .divide(s1_pre_refinedLee.select('VV'))
+  .log10()
+  .multiply(10); // Convert to decibels
+
+// Compute the log-ratio for VH polarization
+var VH_logRatio = s1_post_refinedLee.select('VH')
+  .divide(s1_pre_refinedLee.select('VH'))
+  .log10()
+  .multiply(10); // Convert to decibels
+  
+// ****** Remaining done in the google colab ****** \\
+
+// Load the masked images
+var masked_VV_logRatio = ee.Image('projects/ee-anandunr584/assets/masked_VV_logRatio').clip(geometry2);
+var masked_VH_logRatio = ee.Image('projects/ee-anandunr584/assets/masked_VH_logRatio').clip(geometry2);
+/*
+// Get the projection information from the VV log-ratio image and VH log -ratio
+var vv_projection = VV_logRatio.projection();
+var vh_projection = VH_logRatio.projection();
+
+// Reproject the VV masked log-ratio image to match the VV log-ratio image
+var reprojected_masked_VV_logRatio = masked_VV_logRatio.reproject({
+  crs: vv_projection.crs(),
+  scale: vv_projection.nominalScale()
+});
+
+// Reproject the masked VH log-ratio image to match the VH log-ratio image
+var reprojected_masked_VH_logRatio = masked_VH_logRatio.reproject({
+  crs: vh_projection.crs(),
+  scale: vh_projection.nominalScale()
+});
+
+// Clip the reprojected images to the same region
+var clipped_masked_VV_logRatio = reprojected_masked_VV_logRatio.clip(geometry);
+var clipped_masked_VH_logRatio = reprojected_masked_VH_logRatio.clip(geometry);
+*/
+
+////////////  Ground truth  \\\\\\\\\\\\\
+
+// Load the ground truth FeatureCollection
+var groundTruth = ee.FeatureCollection('projects/ee-anandunr584/assets/fire_ground_truth').filterBounds(geometry2);
+// Create the ground truth raster with fire presence as binary
+var groundTruthRaster = groundTruth.map(function(feature) {
+  var isFire = ee.Algorithms.If(
+    ee.String(feature.get('Etat')).match('Atteint par le feu|NOUVEAU FEU'),
+    1,
+    0
+  );
+  return feature.set('fire', isFire);
+}).reduceToImage({
+  properties: ['fire'],  // The new property indicating fire presence
+  reducer: ee.Reducer.first()
+}).gt(0);
+// Create an image of the entire region in yellow
+var fullRegion = ee.Image.constant(0).clip(geometry2);
+// Mask the full region image with the fire presence areas to keep red where fire is present
+var firePresence = groundTruthRaster.mask(groundTruthRaster);
+// Combine the full region image (yellow) with the fire presence image (red)
+var fireMap = fullRegion.where(firePresence, 1);
+// Uploading in drive
+// Function to apply visualization parameters to an image
+// Define visualization parameters for binary image
+var visParams_fire = {
+  min: 0,
+  max: 1,
+  palette: ['black', 'white'],  // Yellow for 0 (no fire), Red for 1 (fire)
+  opacity: 0.7  // Adjust opacity for better visualization
+};
+
+
+
+
+
+
+
+
+
+//////// Sentinel 2 images preprocessing \\\\\\\\\
+
+// Function to mask clouds using the QA60 band
+function maskClouds(image) {
+  var qa = image.select('QA60');
+  var cloudBitMask = 1 << 10;
+  var cirrusBitMask = 1 << 11;
+  var mask = qa.bitwiseAnd(cloudBitMask).eq(0)
+               .and(qa.bitwiseAnd(cirrusBitMask).eq(0));
+  return image.updateMask(mask);
+}
+// Sentinel2 images, checking the available dates and number of images 
+var s2 = ee.ImageCollection('COPERNICUS/S2')
+           .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
+           .filterBounds(geometry)
+           .map(maskClouds);
+print('Number of images in the collection:', s2.size());
+// Get the list of dates
+var dates = s2.aggregate_array('system:time_start')
+              .map(function(d) {
+                return ee.Date(d).format('YYYY-MM-dd');
+              });
+print('Available dates:', dates);
+// Pre-fire image collection
+var s2_pre = ee.ImageCollection('COPERNICUS/S2')
+  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
+  .filterBounds(geometry)
+  .map(maskClouds)
+  .filterDate('2023-04-08', '2023-04-09');
+// Create the pre-fire composite
+
+// Print the size of the image collection to debug
+print('Number of images in s2_pre collection:', s2_pre.size());
+var Prefire = ee.Image(s2_pre.median()).clip(geometry2);
+// Post-fire image collection
+var s2_post = ee.ImageCollection('COPERNICUS/S2')
+  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
+  .filterBounds(geometry)
+  .map(maskClouds)
+  .filterDate('2023-12-04', '2023-12-05');
+// Create the post-fire composite
+var Postfire = ee.Image(s2_post.median()).clip(geometry2);
+
+// Define a function for Dark Object Subtraction (DOS) atmospheric correction
+function dos(image) {
+  // Select bands to correct
+  var bands = ['B2', 'B3', 'B4', 'B8'];
+  // Compute dark object (minimum) values for each band
+  var darkObjects = image.select(bands).reduceRegion({
+    reducer: ee.Reducer.percentile([1]),
+    geometry: image.geometry(),
+    scale: 10,
+    maxPixels: 1e13,
+    bestEffort: true
+  });
+  // Create an image of dark object values
+  var darkObjectImage = ee.Image.constant(darkObjects.values(bands));
+  // Subtract dark object values from each band
+  var corrected = image.select(bands).subtract(darkObjectImage);
+  return image.addBands(corrected, null, true);
+}
+// Apply the DOS function to the image
+var correctedpreImage = dos(Prefire);
+var correctedpostImage = dos(Postfire);
+
+var nir_pre = correctedpreImage.select('B8')
+var swir_pre = correctedpreImage.select('B12')
+var nbrPre = nir_pre.subtract(swir_pre).divide(nir_pre.add(swir_pre))
+var nir_post = correctedpostImage.select('B8')
+var swir_post = correctedpostImage.select('B12')
+var nbrPost = nir_post.subtract(swir_post).divide(nir_post.add(swir_post))
+// Function to calculate differenced NBR (dNBR)
+function calculateDNBR(nbrPre, nbrPost) {
+  var dnbr = nbrPre.subtract(nbrPost).rename('dNBR');
+  return nbrPre.addBands(dnbr);
+}
+// Calculate dNBR
+var dNBR = calculateDNBR(nbrPre, nbrPost);
+
+
+
+
+//////// Adding Layers to the map \\\\\\\
+Map.centerObject(geometry2, 10);
+Map.addLayer( PreNoTerrainCorrection, vizParams, "S1-No Terrain Correction Pre Fire");
+Map.addLayer(PrefirstTerrainCorrection,vizParams,"S1-Terrain corrected Pre fire");
+Map.addLayer(s1_pre_refinedLee,vizParams,"S1-Refined lee Pre fire");
+Map.addLayer( PostNoTerrainCorrection, vizParams, "S1-No Terrain Correction Post Fire");
+Map.addLayer(PostfirstTerrainCorrection,vizParams,"S1-Terrain corrected Post fire");
+Map.addLayer(s1_post_refinedLee,vizParams,"S1-Refined lee Post fire");
+Map.addLayer(VV_logRatio, {min: 0.03135079321174161,max: 1.148254895265227,gamma: 1}, 'S1-VV Log-Ratio');
+Map.addLayer(VH_logRatio, {min: 0.09595890036944149,max: 0.9411812994346116,gamma: 1}, 'S1-VH Log-Ratio');
+Map.addLayer(masked_VV_logRatio, {min: 0, max: 1, palette: ['black', 'white']}, 'Input1: Masked VV Log Ratio');
+Map.addLayer(masked_VH_logRatio, {min: 0, max: 1, palette: ['black', 'white']}, 'Input2: Masked VH Log Ratio');
+Map.addLayer(Prefire, {min:4000,max:10000}, "S2-Non corrected Pre Fire");
+Map.addLayer(Postfire, {min:3000,max:10000}, "S2-Non corrected Post Fire");
+Map.addLayer(correctedpreImage, {min:2000, max:8000}, "S2-Pre Fire  corrected");
+Map.addLayer(correctedpostImage, {min: 2000, max:6000}, "S2-Post Fire corrected");
+Map.addLayer(nbrPre, {min: -1, max: 1, palette: ['red', 'yellow', 'green']}, 'S2-NBR Pre-fire');
+Map.addLayer(nbrPost, {min: -1, max: 1, palette: ['red', 'yellow', 'green']}, 'S2-NBR Post-fire');
+Map.addLayer(dNBR.select('dNBR'), {min: -1, max: 1, palette: ['red', 'yellow', 'green']}, 'Input3: dNBR');
+Map.addLayer(fireMap, visParams_fire, 'Ground Truth Fire Map');
+
+
+//// Combining all the inputs with the fire images \\\\\
+var combinedImage = masked_VH_logRatio.select('b1').rename('VH')
+  .addBands(masked_VV_logRatio.select('b1').rename('VV'))
+  .addBands(dNBR.select('dNBR').rename('dNBR'))
+  .addBands(fireMap.select('constant').rename('Fire'));
+  
+Map.addLayer(combinedImage,{},'Combined Image');
+
+Map.addLayer(image)
+
